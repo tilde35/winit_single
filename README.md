@@ -6,7 +6,7 @@ This is a small utility library to simplify the usage of `winit` for single-wind
 
 Little to no support will be provided for this library as I am currently occupied developing a game (Penta Terra).
 
-Feel free to take anything from here and utilize it in your own projects or libraries. Thanks!
+Feel free to take anything from here and utilize it in your own projects or libraries, no credit required. Thanks!
 
 # Setup
 
@@ -46,16 +46,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         win.request_redraw();
                         // Perform drawing here
                     }
-                    _ => {
-                        println!("Event: {:?}", event);
-                    }
+                    _ => {}
                 },
-                winit::event::Event::AboutToWait | winit::event::Event::NewEvents(..) => {
-                    // Noisy events
-                }
-                _ => {
-                    println!("Event: {:?}", event);
-                }
+                _ => {}
             }
 
             Ok(())

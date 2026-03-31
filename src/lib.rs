@@ -1,9 +1,15 @@
 use winit::{application::ApplicationHandler, event_loop::EventLoop};
 
-// Re-export winit for convenience
+// Re-export winit dependency
 pub use winit;
 
+pub mod prelude {
+    pub use crate::{EventLoopProxy, SingleWindow};
+}
+
 /// A helper for creating a single window application.
+///
+/// The window can be initialized synchronously (`init`/`init_event_type`) or asynchronously (`init_async`/`init_event_type_async`).
 ///
 /// Example Usage:
 /// ```no_run
@@ -52,6 +58,7 @@ pub struct SingleWindow {
     pub capture_cursor: bool,
 }
 impl SingleWindow {
+    /// Synchronous initialization of the application.
     pub fn init(
         self,
         action: impl FnOnce(
@@ -61,21 +68,115 @@ impl SingleWindow {
         ) -> Result<InitCallbackResult<()>, Box<dyn std::error::Error>>
         + 'static,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.init_event_type::<()>(action)
+        let event_loop = <EventLoop<AppEvent<()>>>::with_user_event().build()?;
+        let proxy = EventLoopProxy {
+            proxy: event_loop.create_proxy(),
+        };
+        let mut app = <SingleWindowApp<()>>::new(
+            self,
+            |event_loop, win, _proxy, init| Some(action(event_loop, win, init)),
+            proxy,
+        );
+        event_loop.run_app(&mut app)?;
+        Ok(())
     }
+
+    /// Synchronous initialization of the application with user event support.
+    ///
+    /// User events can be sent using the provided `EventLoopProxy`. This allows for communication with the event loop from other
+    /// threads or async contexts. This can be handled via the `winit::event::Event::UserEvent` variant in the event callback.
     pub fn init_event_type<T: 'static>(
         self,
         action: impl FnOnce(
             &winit::event_loop::ActiveEventLoop,
             &std::sync::Arc<winit::window::Window>,
+            EventLoopProxy<T>,
             InitCallback<T>,
         ) -> Result<InitCallbackResult<T>, Box<dyn std::error::Error>>
         + 'static,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut app = <SingleWindowApp<T>>::new(self, Box::new(action));
-        let event_loop = <EventLoop<T>>::with_user_event().build()?;
+        let event_loop = <EventLoop<AppEvent<T>>>::with_user_event().build()?;
+        let proxy = EventLoopProxy {
+            proxy: event_loop.create_proxy(),
+        };
+        let mut app = <SingleWindowApp<T>>::new(
+            self,
+            |event_loop, win, proxy, init| Some(action(event_loop, win, proxy, init)),
+            proxy,
+        );
         event_loop.run_app(&mut app)?;
         Ok(())
+    }
+
+    /// Asynchronous initialization variant of `init`.
+    ///
+    /// Note: The return behavior of this method is platform dependent. It may return immediately (WASM), after window is closed,
+    /// or never return at all.
+    pub fn init_async<
+        F: std::future::Future<Output = Result<InitCallbackResult<()>, Box<dyn std::error::Error>>>
+            + 'static,
+    >(
+        self,
+        action: impl FnOnce(std::sync::Arc<winit::window::Window>, InitCallback<()>) -> F + 'static,
+    ) {
+        self.init_event_type_async::<(), _>(move |win, _proxy, init| action(win, init))
+    }
+
+    /// Asynchronous initialization variant of `init_event_type`.
+    ///
+    /// User events can be sent using the provided `EventLoopProxy`. This allows for communication with the event loop from other
+    /// threads or async contexts. This can be handled via the `winit::event::Event::UserEvent` variant in the event callback.
+    ///
+    /// Note: The return behavior of this method is platform dependent. It may return immediately (WASM), after window is closed,
+    /// or never return at all.
+    pub fn init_event_type_async<
+        T: 'static,
+        F: std::future::Future<Output = Result<InitCallbackResult<T>, Box<dyn std::error::Error>>>
+            + 'static,
+    >(
+        self,
+        action: impl FnOnce(
+            std::sync::Arc<winit::window::Window>,
+            EventLoopProxy<T>,
+            InitCallback<T>,
+        ) -> F
+        + 'static,
+    ) {
+        let event_loop = <EventLoop<AppEvent<T>>>::with_user_event()
+            .build()
+            .expect("Failed to build event loop");
+        let proxy = EventLoopProxy {
+            proxy: event_loop.create_proxy(),
+        };
+        let mut app = <SingleWindowApp<T>>::new(
+            self,
+            |_event_loop, win, proxy, init| {
+                // Web platforms: Spawn the async initialization without blocking
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let win = win.clone();
+                    let proxy = proxy.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let result = action(win, proxy.clone(), init).await;
+                        proxy
+                            .proxy
+                            .send_event(AppEvent::DeferredInit(result))
+                            .ok()
+                            .expect("Failed to send deferred init event");
+                    });
+                    return None;
+                }
+
+                // Native platforms: Block on the async initialization once the window is ready.
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let result = pollster::block_on(action(win.clone(), proxy, init));
+                    return Some(result);
+                }
+            },
+            proxy,
+        );
+        event_loop.run_app(&mut app).expect("Application error");
     }
 }
 impl Default for SingleWindow {
@@ -95,6 +196,25 @@ impl Default for SingleWindow {
             icon: None,
             hide_cursor: false,
             capture_cursor: false,
+        }
+    }
+}
+
+pub struct EventLoopProxy<T: 'static> {
+    proxy: winit::event_loop::EventLoopProxy<AppEvent<T>>,
+}
+impl<T: 'static> EventLoopProxy<T> {
+    pub fn send_user_event(
+        &self,
+        event: T,
+    ) -> Result<(), winit::event_loop::EventLoopClosed<AppEvent<T>>> {
+        self.proxy.send_event(AppEvent::UserEvent(event))
+    }
+}
+impl<T: 'static> Clone for EventLoopProxy<T> {
+    fn clone(&self) -> Self {
+        Self {
+            proxy: self.proxy.clone(),
         }
     }
 }
@@ -134,19 +254,25 @@ struct SingleWindowApp<T: 'static> {
 impl<T: 'static> SingleWindowApp<T> {
     fn new(
         cfg: SingleWindow,
-        callback: Box<
-            dyn FnOnce(
-                &winit::event_loop::ActiveEventLoop,
-                &std::sync::Arc<winit::window::Window>,
-                InitCallback<T>,
-            ) -> Result<InitCallbackResult<T>, Box<dyn std::error::Error>>,
-        >,
+        callback: impl FnOnce(
+            &winit::event_loop::ActiveEventLoop,
+            &std::sync::Arc<winit::window::Window>,
+            EventLoopProxy<T>,
+            InitCallback<T>,
+        )
+            -> Option<Result<InitCallbackResult<T>, Box<dyn std::error::Error>>>
+        + 'static,
+        proxy: EventLoopProxy<T>,
     ) -> Self {
         #[cfg(target_arch = "wasm32")]
         console_error_panic_hook::set_once();
 
         Self {
-            state: SingleWindowAppState::AwaitingResume(cfg, Some(callback), Vec::new()),
+            state: SingleWindowAppState::AwaitingResume(
+                cfg,
+                Some((Box::new(callback), proxy)),
+                Vec::new(),
+            ),
         }
     }
 
@@ -236,9 +362,13 @@ impl<T: 'static> SingleWindowApp<T> {
                             window.set_cursor_visible(false);
                         }
 
-                        let result = if let Some(callback) = callback.take() {
-                            callback(event_loop, &window, InitCallback(std::marker::PhantomData))
-                                .expect("Failed to initialize window")
+                        let result = if let Some((callback, proxy)) = callback.take() {
+                            callback(
+                                event_loop,
+                                &window,
+                                proxy,
+                                InitCallback(std::marker::PhantomData),
+                            )
                         } else {
                             unreachable!(
                                 "Callback should be present when transitioning from AwaitingResume to MainLoop"
@@ -247,9 +377,18 @@ impl<T: 'static> SingleWindowApp<T> {
 
                         let pending_events = std::mem::take(pending_events);
 
-                        self.state = SingleWindowAppState::MainLoop(window, result.callback);
-                        for evt in pending_events {
-                            self.process_event(event_loop, evt);
+                        match result {
+                            Some(result) => {
+                                let callback = result.expect("Initialization failed").callback;
+                                self.state = SingleWindowAppState::MainLoop(window, callback);
+                                for evt in pending_events {
+                                    self.process_event(event_loop, evt);
+                                }
+                            }
+                            None => {
+                                self.state =
+                                    SingleWindowAppState::AwaitingInit(window, pending_events);
+                            }
                         }
                     }
                     _ => {
@@ -261,10 +400,17 @@ impl<T: 'static> SingleWindowApp<T> {
             SingleWindowAppState::MainLoop(window, callback) => {
                 callback(event_loop, window, evt).expect("Failed to process event");
             }
+            SingleWindowAppState::AwaitingInit(_window, events) => {
+                // Still waiting for initialization to complete, store events for later processing
+                events.push(evt);
+            }
+            SingleWindowAppState::Placeholder => {
+                unreachable!("Placeholder state should never be active");
+            }
         }
     }
 }
-impl<T: 'static> ApplicationHandler<T> for SingleWindowApp<T> {
+impl<T: 'static> ApplicationHandler<AppEvent<T>> for SingleWindowApp<T> {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         let evt = winit::event::Event::Resumed;
         self.process_event(event_loop, evt);
@@ -289,9 +435,25 @@ impl<T: 'static> ApplicationHandler<T> for SingleWindowApp<T> {
         self.process_event(event_loop, evt);
     }
 
-    fn user_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, event: T) {
-        let evt = winit::event::Event::UserEvent(event);
-        self.process_event(event_loop, evt);
+    fn user_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, event: AppEvent<T>) {
+        match event {
+            AppEvent::UserEvent(u) => {
+                let evt = winit::event::Event::UserEvent(u);
+                self.process_event(event_loop, evt);
+            }
+            AppEvent::DeferredInit(result) => {
+                let callback = result.expect("Deferred initialization failed").callback;
+                let state = std::mem::replace(&mut self.state, SingleWindowAppState::Placeholder);
+                if let SingleWindowAppState::AwaitingInit(window, pending_events) = state {
+                    self.state = SingleWindowAppState::MainLoop(window, callback);
+                    for evt in pending_events {
+                        self.process_event(event_loop, evt);
+                    }
+                } else {
+                    panic!("DeferredInit event received in invalid state");
+                }
+            }
+        }
     }
 
     fn device_event(
@@ -325,19 +487,26 @@ impl<T: 'static> ApplicationHandler<T> for SingleWindowApp<T> {
     }
 }
 
+pub enum AppEvent<T: 'static> {
+    UserEvent(T),
+    DeferredInit(Result<InitCallbackResult<T>, Box<dyn std::error::Error>>),
+}
+
 enum SingleWindowAppState<T: 'static> {
     AwaitingResume(
         SingleWindow,
-        Option<
+        Option<(
             Box<
                 dyn FnOnce(
                     &winit::event_loop::ActiveEventLoop,
                     &std::sync::Arc<winit::window::Window>,
+                    EventLoopProxy<T>,
                     InitCallback<T>,
                 )
-                    -> Result<InitCallbackResult<T>, Box<dyn std::error::Error>>,
+                    -> Option<Result<InitCallbackResult<T>, Box<dyn std::error::Error>>>,
             >,
-        >,
+            EventLoopProxy<T>,
+        )>,
         Vec<winit::event::Event<T>>,
     ),
     MainLoop(
@@ -350,4 +519,9 @@ enum SingleWindowAppState<T: 'static> {
             ) -> Result<(), Box<dyn std::error::Error>>,
         >,
     ),
+    AwaitingInit(
+        std::sync::Arc<winit::window::Window>,
+        Vec<winit::event::Event<T>>,
+    ),
+    Placeholder,
 }
