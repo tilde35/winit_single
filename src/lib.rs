@@ -1,5 +1,8 @@
 use winit::{application::ApplicationHandler, event_loop::EventLoop};
 
+// Re-export winit for convenience
+pub use winit;
+
 /// A helper for creating a single window application.
 ///
 /// Example Usage:
@@ -139,7 +142,7 @@ impl<T: 'static> SingleWindowApp<T> {
             ) -> Result<InitCallbackResult<T>, Box<dyn std::error::Error>>,
         >,
     ) -> Self {
-        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        #[cfg(target_arch = "wasm32")]
         console_error_panic_hook::set_once();
 
         Self {

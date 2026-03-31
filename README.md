@@ -8,11 +8,9 @@ Little to no support will be provided for this library as I am currently occupie
 
 Feel free to take anything from here and utilize it in your own projects or libraries. Thanks!
 
-# Known Issues
-
-WASM support was started, but not yet tested. There are likely bugs in that code. 
-
 # Setup
+
+## Desktop Setup
 
 Add the following to your `Cargo.toml` dependencies section:
 
@@ -21,4 +19,51 @@ Add the following to your `Cargo.toml` dependencies section:
 winit_single = { git = "https://github.com/tilde35/winit_single", branch = "winit_0_30" }
 ```
 
-The `examples/simple.rs` file provides a good starting point for new applications.
+Quick starting point for `main.rs`:
+
+```rust
+use winit_single::{SingleWindow, winit};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = SingleWindow {
+        title: "Simple App".to_string(),
+        ..Default::default()
+    };
+    cfg.init(|_event_loop, win, init| {
+        // Perform graphics init, etc.
+        win.request_redraw();
+
+        init.run(move |event_loop, win, event| {
+            match &event {
+                winit::event::Event::WindowEvent {
+                    window_id: _,
+                    event: w,
+                } => match w {
+                    winit::event::WindowEvent::CloseRequested => {
+                        event_loop.exit();
+                    }
+                    winit::event::WindowEvent::RedrawRequested => {
+                        win.request_redraw();
+                        // Perform drawing here
+                    }
+                    _ => {
+                        println!("Event: {:?}", event);
+                    }
+                },
+                winit::event::Event::AboutToWait | winit::event::Event::NewEvents(..) => {
+                    // Noisy events
+                }
+                _ => {
+                    println!("Event: {:?}", event);
+                }
+            }
+
+            Ok(())
+        })
+    })
+}
+```
+
+## Web Setup (WASM)
+
+See [WebSetup.md](WebSetup.md) for details.
